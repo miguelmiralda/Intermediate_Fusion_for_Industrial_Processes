@@ -11,7 +11,7 @@ from sensor_processing import load_sensor_csv, clean_sensor_df, resample_sensor,
 from image_processing import batch_process_images
 
 #Common factors in all sets
-IMG_SIZE = (224, 224)
+IMG_SIZE = (600, 400)
 IMG_MODE = "RGB"
 IMG_CROP = "center"
 
@@ -279,7 +279,7 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) == 1:
         # default action when we click Run
-        # sys.argv += ["--set", "2"]   # or "--all"
-        sys.argv += ["--all"]   # or "--all"
-        # sys.argv += ["--overwrite"]   # or "--all"
+        # sys.argv += ["--set", "2"]   #Processes only Specific set...
+        sys.argv += ["--all"]   #Processes all the sets...
+        sys.argv += ["--overwrite"]   #Enables this if the sets are already processed and needs to be overwrite...
     main()

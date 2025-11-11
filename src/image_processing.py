@@ -28,7 +28,7 @@ def to_mode(img: Image.Image, mode: str = "RGB") -> Image.Image:
     return img.convert(mode)
 
 def resize_and_crop(img: Image.Image,
-                    size: Tuple[int, int] = (224, 224),
+                    size: Tuple[int, int] = (600, 400),
                     crop: str = "center") -> Image.Image:
     target_w, target_h = size
     w, h = img.size
