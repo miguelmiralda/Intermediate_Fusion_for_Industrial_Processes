@@ -16,7 +16,7 @@ print("Loading metadata...") #For flow checking, can be removed.
 labels_df = pd.read_csv(LABELS_CSV)
 sets_df = pd.read_csv(SETS_CSV)
 
-labels_set2 = labels_df[labels_df["Set"] == 2].copy()
+labels_set2 = labels_df[labels_df["Set"] == 1].copy()
 print(f"Loaded {len(labels_set2)} labels rows for Set2.") #For flow checking, can be removed.
 
 #Checking whether the files (sensor & image) listed in labels.csv actually exists...

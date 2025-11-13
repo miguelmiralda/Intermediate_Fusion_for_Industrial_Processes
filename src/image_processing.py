@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Iterable, Tuple, List, Dict
+from typing import Iterable, Tuple, List, Dict, Optional
 from PIL import Image, UnidentifiedImageError
 import pandas as pd
 
@@ -26,6 +26,10 @@ def to_mode(img: Image.Image, mode: str = "RGB") -> Image.Image:
         # convert via RGB to avoid palette quirks
         return img.convert("RGB").convert("L")
     return img.convert(mode)
+
+def crop_box(img: Image.Image, box: Tuple[int, int, int, int]) -> Image.Image:
+    L, T, R, B = map(int, box)
+    return img.crop((L, T, R, B))
 
 def resize_and_crop(img: Image.Image,
                     size: Tuple[int, int] = (600, 400),
@@ -59,10 +63,11 @@ def resize_and_crop(img: Image.Image,
 
 def process_image_file(src_path: Path,
                        dest_root: Path,
-                       size: Tuple[int, int] = (224, 224),
+                       size: Tuple[int, int] = (600, 400),
                        mode: str = "RGB",
                        crop: str = "center",
-                       keep_name: bool = False) -> Dict:
+                       keep_name: bool = False,
+                       crop_box_coords: Optional[Tuple[int, int, int, int]] = None) -> Dict:
 
     #Load → standardize mode → resize/crop → save PNG.
     meta = {
@@ -86,16 +91,18 @@ def process_image_file(src_path: Path,
     meta["orig_mode"] = img.mode
 
     img = to_mode(img, mode=mode)
-    img = resize_and_crop(img, size=size, crop=crop)
+    if crop_box_coords is not None:
+        #Based on paper: fixed ROI, then resize to target size
+        img = crop_box(img, crop_box_coords)
+        if img.size != size:
+            img = img.resize(size, Image.BICUBIC)
+    else:
+        img = resize_and_crop(img, size=size, crop=crop)
+
 
     dest_root.mkdir(parents=True, exist_ok=True)
 
-    if keep_name:
-        out_name = f"{src_path.stem}.png"
-    else:
-        # safe, normalized name
-        out_name = f"{src_path.stem.replace(' ', '_').lower()}.png"
-
+    out_name = f"{src_path.stem}.png" if keep_name else f"{src_path.stem.replace(' ', '_').lower()}.png"
     out_path = dest_root / out_name
     img.save(out_path, format="PNG", optimize=True)
     meta["saved_path"] = str(out_path)
@@ -104,17 +111,18 @@ def process_image_file(src_path: Path,
 def batch_process_images(image_names: Iterable[str],
                          src_dir: Path,
                          dest_dir: Path,
-                         size: Tuple[int, int] = (224, 224),
+                         size: Tuple[int, int] = (600, 400),
                          mode: str = "RGB",
                          crop: str = "center",
-                         keep_name: bool = False) -> pd.DataFrame:
+                         keep_name: bool = False,
+                         crop_box_coords: Optional[Tuple[int, int, int, int]] = None) -> pd.DataFrame:
 
     #Process a list of image filenames from src_dir → dest_dir.
     rows: List[Dict] = []
     for name in image_names:
         meta = process_image_file(Path(src_dir) / name,
                                   Path(dest_dir),
-                                  size=size, mode=mode, crop=crop, keep_name=keep_name)
+                                  size=size, mode=mode, crop=crop, keep_name=keep_name, crop_box_coords=crop_box_coords)
         # include a normalized `image_id` for downstream merges
         meta["image_name"] = name
         meta["image_id"] = Path(meta["saved_path"]).stem if meta["saved_path"] else Path(name).stem

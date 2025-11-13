@@ -9,6 +9,9 @@ import numpy as np
 
 from sensor_processing import load_sensor_csv, clean_sensor_df, resample_sensor, extract_window
 from image_processing import batch_process_images
+import re
+
+_NAME_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T_](\d{2})[:_](\d{2})[:_](\d{2})(?:[._](\d+))?")
 
 #Common factors in all sets
 IMG_SIZE = (600, 400)
@@ -17,6 +20,22 @@ IMG_CROP = "center"
 
 SENSOR_RATE_HZ = 1000        # resampled rate
 WINDOW_SECONDS = 1.0         # symmetric window around image time (±0.5s)
+
+def _ts_from_sensor_name(name: str) -> pd.Timestamp | pd.NaT:
+    """
+    Parse e.g. '...2022-11-23T10_14_39.119958.csv' -> naive pandas Timestamp.
+    """
+    m = _NAME_TS.search(name)
+    if not m:
+        return pd.NaT
+    date, hh, mm, ss, frac = m.groups()
+    frac = frac or "0"
+    # build string 'YYYY-MM-DD HH:MM:SS.frac'
+    s = f"{date} {hh}:{mm}:{ss}.{frac}"
+    ts = pd.to_datetime(s, errors="coerce", utc=False)
+    if isinstance(ts, pd.Timestamp) and getattr(ts, "tzinfo", None) is not None:
+        ts = ts.tz_localize(None)
+    return ts
 
 def _parse_time_naive(ts: pd.Series) -> pd.Series:
     #Parse date-times and ensuring they are naive...
@@ -51,6 +70,19 @@ def _paths_for_set(base_dir: Path, set_id: int):
         "labels_csv": labels_csv,
         "sets_csv": sets_csv,
     }
+
+def _parse_crop_box_str(s: str) -> tuple[int,int,int,int] | None:
+    if not isinstance(s, str):
+        return None
+    # grab first four integers in order (robust to spaces/commas)
+    nums = re.findall(r"-?\d+", s)
+    if len(nums) < 4:
+        return None
+    L, T, R, B = map(int, nums[:4])
+    # optional sanity checks
+    if R <= L or B <= T:
+        return None
+    return (L, T, R, B)
 
 #Processing the sets - Core of this module...
 def process_set(set_id: int, *, overwrite: bool = False) -> dict:
@@ -89,6 +121,7 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
         labels["SensorDateTime"] = _parse_time_naive(labels["SensorDateTime"])
 
     #Join set parameters (copy columns across all rows)
+    set_crop = None
     if "Set" in sets_meta.columns:
         set_params = sets_meta[sets_meta["Set"] == set_id].copy()
         if len(set_params):
@@ -96,6 +129,9 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
                 if col == "Set":
                     continue
                 labels[col] = set_params[col].values[0]
+            if "crop" in set_params.columns:
+                raw_crop = str(set_params.iloc[0] ["crop"])
+                set_crop = _parse_crop_box_str(raw_crop)
 
     #Processing images...
     print("Processing images ...")
@@ -106,6 +142,7 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
         dest_dir=P["proc_img_dir"],
         size=IMG_SIZE, mode=IMG_MODE, crop=IMG_CROP,
         keep_name=False,
+        crop_box_coords=set_crop,
     )
     img_meta.to_csv(P["proc_root"] / "image_meta.csv", index=False)
     img_lookup = {row["image_name"]: row.to_dict() for _, row in img_meta.iterrows()}
@@ -135,11 +172,29 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
             sample_sen = cand
             break
 
+    #Probe block...
     if sample_sen is not None:
         sdf_probe = load_sensor_csv(P["sensor_dir"] / sample_sen)
         print("Probe parsed rows:", len(sdf_probe), "ts nulls:", sdf_probe["timestamp"].isna().sum())
     else:
         print("Probe skipped: no valid SensorName found on disk for this set.")
+
+    # ---- Set1: estimate a single clock offset (median) between ImageDateTime and sensor-name timestamp
+    set1_offset = pd.Timedelta(0)
+    if set_id == 1:
+        deltas = []
+        for _, r in labels.iterrows():
+            img_ts = r.get("ImageDateTime", pd.NaT)
+            name_ts = _ts_from_sensor_name(str(r.get("SensorName", "")))
+            if pd.notna(img_ts) and pd.notna(name_ts):
+                deltas.append(img_ts - name_ts)  # positive if image clock is ahead
+        if deltas:
+            # median is robust against outliers
+            set1_offset = pd.Series(deltas).median()
+            # sanity cap: ignore absurd offsets (> 6 hours)
+            if abs(set1_offset.total_seconds()) > 6 * 3600:
+                set1_offset = pd.Timedelta(0)
+        print("Set1 estimated offset (image - sensor_name_ts):", set1_offset)
 
     for _, row in labels.iterrows():
         imgname = row["ImageName"]
@@ -186,10 +241,99 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
             continue
 
         #extract centered window
-        win = extract_window(sdf, anchor_time=anchor_time, window_seconds=WINDOW_SECONDS)
+        if set_id == 1:
+            win = None
+            anchor_used = None
+            ws_used = WINDOW_SECONDS
+
+            img_ts = row["ImageDateTime"]
+            sen_ts = row["SensorDateTime"] if ("SensorDateTime" in row and pd.notna(row["SensorDateTime"])) else pd.NaT
+            name_ts = _ts_from_sensor_name(senname)
+
+            strategies = []
+
+            # A) Image time (as recorded)
+            if pd.notna(img_ts):
+                strategies.append(("image", img_ts, WINDOW_SECONDS))
+
+            # B) SensorDateTime (if present)
+            if pd.notna(sen_ts):
+                strategies.append(("sensor", sen_ts, WINDOW_SECONDS))
+
+            # C) Image shifted by per-set median offset (robust calibration)
+            if pd.notna(img_ts) and set1_offset != pd.Timedelta(0):
+                strategies.append(("image_set_offset", img_ts - set1_offset, WINDOW_SECONDS))
+
+            # D) Timestamp parsed from sensor filename (often the true capture time)
+            if pd.notna(name_ts):
+                strategies.append(("sensor_name_ts", name_ts, WINDOW_SECONDS))
+
+            # E) Wider window around best image guess (edge saver)
+            if pd.notna(img_ts):
+                strategies.append(("image_wide", img_ts, 1.5))
+
+            # Try in order; accept partial overlap rule from extract_window
+            for tag, at, ws in strategies:
+                w = extract_window(sdf, anchor_time=at, window_seconds=ws)
+                if w is not None and len(w) > 0:
+                    win = w
+                    anchor_used = tag
+                    ws_used = ws
+                    break
+
+            # After trying all strategies above, try a nearest-sensor rescue
+            if win is None:
+                # build candidate anchors we tried (ignore NaT)
+                cands = []
+                if pd.notna(img_ts):
+                    cands.append(img_ts)
+                if pd.notna(sen_ts):
+                    cands.append(sen_ts)
+                if set1_offset != pd.Timedelta(0) and pd.notna(img_ts):
+                    cands.append(img_ts - set1_offset)
+                if pd.notna(name_ts):
+                    cands.append(name_ts)
+
+                if cands:
+                    ts_series = sdf["timestamp"]
+                    best_anchor = None
+                    best_gap = None
+                    for t in cands:
+                        idx_near = (ts_series - t).abs().idxmin()
+                        near_ts = ts_series.loc[idx_near]
+                        gap = abs((near_ts - t).total_seconds())
+                        if (best_gap is None) or (gap < best_gap):
+                            best_gap = gap
+                            best_anchor = near_ts
+
+                    # if the nearest sample is reasonably close, center a slightly wider window there
+                    if (best_anchor is not None) and (best_gap is not None) and best_gap <= 2.0:
+                        w = extract_window(sdf, anchor_time=best_anchor, window_seconds=2.0)
+                        if w is not None and len(w) > 0:
+                            win = w
+                            anchor_used = "nearest_sensor_time"
+                            ws_used = 2.0
+
+        else:
+            # (unchanged for other sets)
+            win = extract_window(sdf, anchor_time=anchor_time, window_seconds=WINDOW_SECONDS)
+            anchor_used = "sensor" if ("SensorDateTime" in row and pd.notna(row["SensorDateTime"])) else "image"
+            ws_used = WINDOW_SECONDS
+
         if win is None or len(win) == 0:
+            if set_id == 1 and drop_counts["insufficient_window_coverage"] < 5:
+                smin, smax = sdf["timestamp"].iloc[0], sdf["timestamp"].iloc[-1]
+                print(f"[Set1 FAIL] {senname}  sensor=[{smin} .. {smax}]  "
+                      f"img_ts={row.get('ImageDateTime')}  "
+                      f"sen_ts={row.get('SensorDateTime')}  "
+                      f"name_ts={_ts_from_sensor_name(senname)}  "
+                      f"offset={set1_offset}")
             drop_counts["insufficient_window_coverage"] += 1
             continue
+
+    # if win is None or len(win) == 0:
+        #             drop_counts["insufficient_window_coverage"] += 1
+        #             continue
 
         #save window as npz (one file per sample), use processed image_id as base
         image_id = meta["image_id"]
@@ -213,10 +357,13 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
             "sensor_name": senname,
             "sensor_window_path": str(sensor_npz),
             "anchor_time": anchor_time.isoformat(),
+            "anchor_used": anchor_used,
+            "window_seconds_used": ws_used,
             "sensor_window_start": win["timestamp"].iloc[0].isoformat(),
             "sensor_window_end":   win["timestamp"].iloc[-1].isoformat(),
             "wear": row.get("wear", np.nan),
             "type": row.get("type", None),
+
         })
 
     #Outputs...
@@ -235,6 +382,7 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
             "img_size": IMG_SIZE,
             "img_mode": IMG_MODE,
             "img_crop": IMG_CROP,
+            "img_roi_box": set_crop,
             "sensor_rate_hz": SENSOR_RATE_HZ,
             "window_seconds": WINDOW_SECONDS,
         },
