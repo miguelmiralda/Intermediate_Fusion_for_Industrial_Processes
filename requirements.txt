@@ -2,3 +2,5 @@ pandas
 numpy
 matplotlib
 Pillow
+torch
+torch-vision

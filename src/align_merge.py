@@ -8,13 +8,13 @@ import pandas as pd
 import numpy as np
 
 from sensor_processing import load_sensor_csv, clean_sensor_df, resample_sensor, extract_window
-from image_processing import batch_process_images
+from image_processing import batch_process_images, load_resnet_encoder, encode_image
 import re
 
 _NAME_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T_](\d{2})[:_](\d{2})[:_](\d{2})(?:[._](\d+))?")
 
 #Common factors in all sets
-IMG_SIZE = (600, 400)
+IMG_SIZE = 224
 IMG_MODE = "RGB"
 IMG_CROP = "center"
 
@@ -71,18 +71,18 @@ def _paths_for_set(base_dir: Path, set_id: int):
         "sets_csv": sets_csv,
     }
 
-def _parse_crop_box_str(s: str) -> tuple[int,int,int,int] | None:
-    if not isinstance(s, str):
-        return None
-    # grab first four integers in order (robust to spaces/commas)
-    nums = re.findall(r"-?\d+", s)
-    if len(nums) < 4:
-        return None
-    L, T, R, B = map(int, nums[:4])
-    # optional sanity checks
-    if R <= L or B <= T:
-        return None
-    return (L, T, R, B)
+# def _parse_crop_box_str(s: str) -> tuple[int,int,int,int] | None:
+#     if not isinstance(s, str):
+#         return None
+#     # grab first four integers in order (robust to spaces/commas)
+#     nums = re.findall(r"-?\d+", s)
+#     if len(nums) < 4:
+#         return None
+#     L, T, R, B = map(int, nums[:4])
+#     # optional sanity checks
+#     if R <= L or B <= T:
+#         return None
+#     return (L, T, R, B)
 
 #Processing the sets - Core of this module...
 def process_set(set_id: int, *, overwrite: bool = False) -> dict:
@@ -120,18 +120,18 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
     if "SensorDateTime" in labels.columns:
         labels["SensorDateTime"] = _parse_time_naive(labels["SensorDateTime"])
 
-    #Join set parameters (copy columns across all rows)
-    set_crop = None
-    if "Set" in sets_meta.columns:
-        set_params = sets_meta[sets_meta["Set"] == set_id].copy()
-        if len(set_params):
-            for col in set_params.columns:
-                if col == "Set":
-                    continue
-                labels[col] = set_params[col].values[0]
-            if "crop" in set_params.columns:
-                raw_crop = str(set_params.iloc[0] ["crop"])
-                set_crop = _parse_crop_box_str(raw_crop)
+    # #Join set parameters (copy columns across all rows)
+    # set_crop = None
+    # if "Set" in sets_meta.columns:
+    #     set_params = sets_meta[sets_meta["Set"] == set_id].copy()
+    #     if len(set_params):
+    #         for col in set_params.columns:
+    #             if col == "Set":
+    #                 continue
+    #             labels[col] = set_params[col].values[0]
+    #         if "crop" in set_params.columns:
+    #             raw_crop = str(set_params.iloc[0] ["crop"])
+    #             set_crop = _parse_crop_box_str(raw_crop)
 
     #Processing images...
     print("Processing images ...")
@@ -140,12 +140,52 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
         image_names=image_names,
         src_dir=P["img_dir"],
         dest_dir=P["proc_img_dir"],
-        size=IMG_SIZE, mode=IMG_MODE, crop=IMG_CROP,
+        img_size=IMG_SIZE,
         keep_name=False,
-        crop_box_coords=set_crop,
+        save_png=True,
     )
-    img_meta.to_csv(P["proc_root"] / "image_meta.csv", index=False)
-    img_lookup = {row["image_name"]: row.to_dict() for _, row in img_meta.iterrows()}
+
+    device = "cpu"
+    encoder = load_resnet_encoder(device=device)
+
+    embeddings = []
+    for _, row in img_meta.iterrows():
+        if row.get("status") != "ok" or row.get("tensor") is None:
+            embeddings.append([np.nan] * 2048)
+            continue
+
+        tensor = row["tensor"] #Processed image tensor
+        feat = encode_image(tensor, encoder, device=device) #torch tensor [2048]
+        embeddings.append(feat.numpy())
+
+
+    if len(embeddings) == 0:
+        emb_df = pd.DataFrame(columns=[f"emb_{i}" for i in range(2048)])
+    else:
+        #Stack into 2D array [num_images, 2048]
+        emb_arr = np.vstack(embeddings) #shape (N, 2048)
+        #Creating column names emb_0... emb_2047
+        emb_col = [f"emb_{i}" for i in range(emb_arr.shape[1])]
+        emb_df = pd.DataFrame(emb_arr, columns=emb_col, index=img_meta.index)
+
+    #Dropping the tensor column before saving to CSV...
+    if "tensor" in img_meta.columns:
+        img_meta_no_tensor = img_meta.drop(columns=["tensor"])
+    else:
+        img_meta_no_tensor = img_meta
+
+    #Saving plain image metadata without embeddings.
+    img_meta_no_tensor.to_csv(P["proc_root"] / "image_meta.csv", index=False)
+
+    #Concatenate image details (image_name, image_id) + embeddings into another CSV...
+    emb_with_keys = pd.concat([img_meta_no_tensor[["image_name", "image_id"]], emb_df], axis=1)
+    print(f"[Set{set_id}] img_meta rows: {len(img_meta)}")
+    print(f"[Set{set_id}] embeddings rows: {len(emb_df)}")
+    print(f"[Set{set_id}] emb_with_keys shape: {emb_with_keys.shape}")
+
+    emb_with_keys.to_csv(P["proc_root"] / "image_embeddings.csv", index=False)
+
+    img_lookup = {row["image_name"]: row.to_dict() for _, row in img_meta_no_tensor.iterrows()}
 
     #Align + window sensors per image -----
     kept_rows = []
@@ -381,8 +421,8 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
         "params": {
             "img_size": IMG_SIZE,
             "img_mode": IMG_MODE,
-            "img_crop": IMG_CROP,
-            "img_roi_box": set_crop,
+            # "img_crop": IMG_CROP,
+            # "img_roi_box": set_crop,
             "sensor_rate_hz": SENSOR_RATE_HZ,
             "window_seconds": WINDOW_SECONDS,
         },
