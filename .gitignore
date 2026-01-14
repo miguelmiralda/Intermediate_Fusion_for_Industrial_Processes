@@ -1,8 +1,8 @@
 data/
 outputs/
 .idea/
-src/toolmonitor.py
-src/sensor_processing.py
-src/image_processing.py
-src/align_merge.py
+old/toolmonitor.py
+old/sensor_processing.py
+old/image_processing.py
+old/align_merge.py
 src/resnet.ipynb
