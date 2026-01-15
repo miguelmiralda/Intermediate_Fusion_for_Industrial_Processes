@@ -48,6 +48,11 @@ FWAD_TEST_SETS  = [17]
 # Pairing logic: dense all-vs-all sorted by time within type
 PAIR_BY_TIME_COL = "anchor_time"
 
+# Cap dense pairing by index gap: only pair within j-i <= K after sorting by time.
+# Set to None to disable and use full all-vs-all.
+MAX_INDEX_GAP_K = 3 # 5 works well too, Tried 6 and 10, 10 gives huge loss, whereas for 5, there is no big difference..
+
+
 # Columns in merged.csv
 WEAR_COL = "wear"
 TYPE_COL = "type"
@@ -56,7 +61,7 @@ IMAGE_ID_COL = "image_id"
 # Training hyperparams
 BATCH_SIZE = 16
 EPOCHS = 20
-LR = 1e-3
+LR = 5e-4      #Learning Rate {can be 3e-4, 1e-4}
 EMBED_IN_DIM = 2048
 HEAD_EMBED_DIM = 8
 
@@ -132,8 +137,8 @@ def _dense_pairs_from_df_for_type(
         head_idx: int,
 ) -> List[Pair]:
     """
-    Dense all-vs-all pairing (i<j) within the SAME wear_type.
-    Never cross types because 'wear' column mixes the types.
+    Dense pairing (i<j) within the SAME wear_type, with optional cap by index gap:
+    only create pairs where (j - i) <= MAX_INDEX_GAP_K after sorting by time.
     """
     sub = df[df[TYPE_COL] == wear_type].copy()
     if sub.empty:
@@ -157,7 +162,7 @@ def _dense_pairs_from_df_for_type(
             return None
 
     wears: List[float] = []
-    img_ids: List[str] = []
+    # img_ids: List[str] = []
     embs: List[np.ndarray] = []
 
     for _, r in sub.iterrows():
@@ -168,11 +173,15 @@ def _dense_pairs_from_df_for_type(
         if iid not in id2emb:
             continue
         wears.append(float(w))
-        img_ids.append(iid)
+        # img_ids.append(iid)
         embs.append(id2emb[iid])
 
     n = len(wears)
     if n < 2:
+        return []
+
+    K = MAX_INDEX_GAP_K
+    if K is not None and K < 1:
         return []
 
     pairs: List[Pair] = []
@@ -180,13 +189,16 @@ def _dense_pairs_from_df_for_type(
     for i in range(n - 1):
         Ei = embs[i]
         wi = wears[i]
-        for j in range(i + 1, n):
+
+        # If cap is enabled: j runs only up to i+K
+        j_stop = n if K is None else min(n, i + K + 1)
+
+        for j in range(i + 1, j_stop):
             Ej = embs[j]
             wj = wears[j]
             pairs.append(Pair(E_ref=Ei, E_cur=Ej, d_wear=abs(wj - wi), head_idx=head_idx))
 
     return pairs
-
 
 def build_pairs_for_set_multitype(
         set_id: int,
@@ -519,7 +531,6 @@ def train_multhead(
     torch.save(ckpt, out_path)
     print("Saved model to:", out_path)
     return out_path
-
 
 # ----------------------------
 # Main: run both experiments + eval + export
