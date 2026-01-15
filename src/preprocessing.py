@@ -4,15 +4,25 @@ import argparse
 import json
 import os
 import re
-from pathlib import Path
-from typing import Dict, Iterable, List
 import numpy as np
 import pandas as pd
-from PIL import Image, UnidentifiedImageError
 import torch
 import torch.nn as nn
+from pathlib import Path
 from torchvision import transforms
-from torchvision.models import ResNet50_Weights, resnet50
+from typing import Dict, Iterable, List
+from PIL import Image, UnidentifiedImageError
+from torchvision.models import ResNet101_Weights, resnet101
+
+_NAME_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T_](\d{2})[:_](\d{2})[:_](\d{2})(?:[._](\d+))?")
+
+IMG_SIZE = 224
+IMG_MODE = "RGB"
+IMG_CROP = "center"
+
+SENSOR_RATE_HZ = 1625      # change here later (e.g., 1625)
+WINDOW_SECONDS = 1.0       # symmetric window around image time (±0.5s)
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -158,24 +168,26 @@ def load_sensor_csv(path: Path) -> pd.DataFrame:
         sig_cols = [j for j in range(df.shape[1]) if j != ts_idx]
         sig_df = df.iloc[:, sig_cols].apply(pd.to_numeric, errors="coerce")
 
-        # Heuristic positional mapping (common 5 channels): [fx, fy, fz, acoustic, accel]
-        fx = fy = fz = acoustic = accel = np.nan
+        # Heuristic positional mapping (common 5 channels): [accel, acoustic, fx, fy, fz,]
+        accel = acoustic = fx = fy = fz = np.nan
         if sig_df.shape[1] >= 5:
-            fx, fy, fz, acoustic, accel = [sig_df.iloc[:, k] for k in range(5)]
+            accel, acoustic, fx, fy, fz  = [sig_df.iloc[:, k] for k in range(5)]
         elif sig_df.shape[1] == 4:
-            fx, fy, fz, acoustic = [sig_df.iloc[:, k] for k in range(4)]
+            accel, acoustic, fx, fy = [sig_df.iloc[:, k] for k in range(4)]
+            fz = np.nan
         elif sig_df.shape[1] == 3:
-            fx, fy, fz = [sig_df.iloc[:, k] for k in range(3)]
-        # else: leave missing as NaN
+            accel, acoustic, fx = [sig_df.iloc[:, k] for k in range(3)]
+            fy = np.nan
+            fz = np.nan
 
         df = pd.DataFrame(
             {
-                "timestamp": ts,
+                "accel": accel,
+                "acoustic": acoustic,
                 "force_x": fx,
                 "force_y": fy,
                 "force_z": fz,
-                "acoustic": acoustic,
-                "accel": accel,
+                "timestamp": ts,
             }
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
@@ -183,7 +195,7 @@ def load_sensor_csv(path: Path) -> pd.DataFrame:
             df["timestamp"] = df["timestamp"].dt.tz_localize(None)
 
     # Ensure expected columns exist
-    expected = ["timestamp", "accel", "acoustic", "force_x", "force_y", "force_z"]
+    expected = ["accel", "acoustic", "force_x", "force_y", "force_z", "timestamp"]
     for c in expected:
         if c not in df.columns:
             df[c] = np.nan
@@ -216,12 +228,14 @@ def clean_sensor_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def resample_sensor(df: pd.DataFrame, rate_hz: int = 1000) -> pd.DataFrame:
+def resample_sensor(df: pd.DataFrame, rate_hz: int = SENSOR_RATE_HZ) -> pd.DataFrame:
     if df.empty:
         return df
 
     df = df.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
-    rule = f"{int(round(1000 / rate_hz))}ms"  # 'L' = milliseconds
+    # Robust frequency: works for 1000, 1625, 2000, etc.
+    period_ns = int(round(1e9 / rate_hz))  # nanoseconds per sample
+    rule = f"{period_ns}ns"
     out = df.resample(rule).mean()
     out = out.interpolate(limit_direction="both").reset_index()
     return out
@@ -266,10 +280,7 @@ def extract_window(
 
     return out.reset_index(drop=True)
 
-
-
 #Image Processing Related...
-
 def load_image(path: Path) -> Image.Image:
     try:
         with Image.open(path) as im:
@@ -290,7 +301,6 @@ def build_transform(img_size: int):
         ]
     )
 
-
 def process_image_file(
         src_path: Path,
         dest_root: Path,
@@ -301,7 +311,7 @@ def process_image_file(
     """
     Process a single image: load, transform to tensor (normalized for ResNet),
     and optionally save a PNG for visualization.
-    Returns metadata including the tensor and saved path (if applicable).
+    Returns metadata including the tensor and saved path.
     """
     meta = {
         "source_path": str(src_path),
@@ -368,13 +378,12 @@ def batch_process_images(
 
 
 def load_resnet_encoder(device="cpu"):
-    weights = ResNet50_Weights.DEFAULT
-    model = resnet50(weights=weights)
+    weights = ResNet101_Weights.DEFAULT
+    model = resnet101(weights=weights)
 
     # Remove the final classification layer
     encoder = nn.Sequential(*list(model.children())[:-1])
     # Now encoder outputs: [batch, 2048, 1, 1]
-
     encoder.to(device)
     encoder.eval()
     return encoder
@@ -388,22 +397,7 @@ def encode_image(tensor, encoder, device="cpu"):
     return features.squeeze(0).cpu()    # shape [2048]
 
 
-# ============================
-# 3) align_merge.py
-# ============================
-
-_NAME_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T_](\d{2})[:_](\d{2})[:_](\d{2})(?:[._](\d+))?")
-
-
-# Common factors in all sets
-IMG_SIZE = 224
-IMG_MODE = "RGB"
-IMG_CROP = "center"
-
-SENSOR_RATE_HZ = 1000        # resampled rate
-WINDOW_SECONDS = 1.0         # symmetric window around image time (±0.5s)
-
-
+#Aligning and merging....
 def _ts_from_sensor_name(name: str) -> pd.Timestamp | pd.NaT:
     """
     Parse e.g. '...2022-11-23T10_14_39.119958.csv' -> naive pandas Timestamp.
@@ -526,6 +520,10 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
         emb_col = [f"emb_{i}" for i in range(emb_arr.shape[1])]
         emb_df = pd.DataFrame(emb_arr, columns=emb_col, index=img_meta.index)
 
+    # Free memory (tensors are large; no longer needed after embedding extraction)
+    if "tensor" in img_meta.columns:
+        img_meta["tensor"] = None
+
     # Dropping the tensor column before saving to CSV...
     if "tensor" in img_meta.columns:
         img_meta_no_tensor = img_meta.drop(columns=["tensor"])
@@ -542,6 +540,15 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
     print(f"[Set{set_id}] emb_with_keys shape: {emb_with_keys.shape}")
 
     emb_with_keys.to_csv(P["proc_root"] / "image_embeddings.csv", index=False)
+
+    emb_npz_path = P["proc_root"] / "image_embeddings.npz"
+
+    np.savez_compressed(
+        emb_npz_path,
+        embeddings=emb_df.to_numpy(dtype=np.float32),   # (N, 2048)
+        image_id=img_meta_no_tensor["image_id"].to_numpy(),
+        image_name=img_meta_no_tensor["image_name"].to_numpy(),
+    )
 
     img_lookup = {row["image_name"]: row.to_dict() for _, row in img_meta_no_tensor.iterrows()}
 
@@ -732,15 +739,17 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
         image_id = meta["image_id"]
         sensor_base = Path(senname).stem
         sensor_npz = P["proc_sensor_dir"] / f"{sensor_base}.npz"
+        sensor_csv_dir = P["proc_sensor_dir"] / "sensorcsvs"
+        sensor_csv_dir.mkdir(parents=True, exist_ok=True)
+        sensor_csv = sensor_csv_dir / f"{sensor_base}.csv"
         np.savez_compressed(
             sensor_npz,
-            timestamp=win["timestamp"].astype("datetime64[ns]").values,
             accel=win["accel"].values,
             acoustic=win["acoustic"].values,
             force_x=win["force_x"].values,
             force_y=win["force_y"].values,
             force_z=win["force_z"].values,
-            rate_hz=SENSOR_RATE_HZ,
+            timestamp=win["timestamp"].astype("datetime64[ns]").values
         )
 
         kept_rows.append(
@@ -759,6 +768,7 @@ def process_set(set_id: int, *, overwrite: bool = False) -> dict:
                 "type": row.get("type", None),
             }
         )
+        win.to_csv(sensor_csv, index=False)
 
     # Outputs...
     merged_df = pd.DataFrame(kept_rows)
@@ -822,7 +832,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) == 1:
         # default action when we click Run
-        sys.argv += ["--set", "2"]   # Processes only Specific set...
-        # sys.argv += ["--all"]         # Processes all the sets...
+        # sys.argv += ["--set", "2"]   # Processes only Specific set...
+        sys.argv += ["--all"]         # Processes all the sets...
         sys.argv += ["--overwrite"]   # Overwrite existing processed outputs...
     main()
