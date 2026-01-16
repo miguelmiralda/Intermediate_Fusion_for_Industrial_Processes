@@ -407,6 +407,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin = (device.type == "cuda")
 
+    #Training, testing, validation....
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_batch, num_workers=0, pin_memory=pin)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
