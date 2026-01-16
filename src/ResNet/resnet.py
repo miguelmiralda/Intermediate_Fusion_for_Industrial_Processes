@@ -31,7 +31,7 @@ from torch.utils.data import Dataset, DataLoader
 # Config
 # ----------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 MODELS_DIR = PROJECT_ROOT / "models"
 
@@ -50,7 +50,7 @@ PAIR_BY_TIME_COL = "anchor_time"
 
 # Cap dense pairing by index gap: only pair within j-i <= K after sorting by time.
 # Set to None to disable and use full all-vs-all.
-MAX_INDEX_GAP_K = 3 # 5 works well too, Tried 6 and 10, 10 gives huge loss, whereas for 5, there is no big difference..
+MAX_INDEX_GAP_K = 1
 
 
 # Columns in merged.csv
@@ -61,7 +61,7 @@ IMAGE_ID_COL = "image_id"
 # Training hyperparams
 BATCH_SIZE = 16
 EPOCHS = 20
-LR = 5e-4      #Learning Rate {can be 3e-4, 1e-4}
+LR = 5e-4
 EMBED_IN_DIM = 2048
 HEAD_EMBED_DIM = 8
 
@@ -84,10 +84,15 @@ def load_embeddings_npz(npz_path: Path) -> Dict[str, np.ndarray]:
             f"(found: {list(data.keys())})"
         )
 
-    emb = data["embeddings"].astype(np.float32)  # (N, 2048)
-    image_id = data["image_id"].astype(str)      # (N,)
-    return {"embeddings": emb, "image_id": image_id}
+    out = {
+        "embeddings": data["embeddings"].astype(np.float32),  # (N, 2048)
+        "image_id": data["image_id"].astype(str),      # (N,)
+    }
 
+    if "image_name" in data:
+        out["image_name"] = data["image_name"].astype(str)
+
+    return out
 
 def build_imageid_to_embedding(emb_data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     image_ids = emb_data["image_id"]
@@ -101,6 +106,12 @@ def build_imageid_to_embedding(emb_data: Dict[str, np.ndarray]) -> Dict[str, np.
         out[str(image_ids[i])] = vec
     return out
 
+def build_imageid_to_imagename(emb_data: Dict[str, np.ndarray]) -> Dict[str, str]:
+    if "image_name" not in emb_data:
+        return {}
+    ids = emb_data["image_id"]
+    names = emb_data["image_name"]
+    return {str(ids[i]): str(names[i]) for i in range(min(len(ids), len(names)))}
 
 def load_merged_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -397,6 +408,7 @@ def export_head_embeddings_csv(
         df = load_merged_csv(merged_path)
         emb_data = load_embeddings_npz(emb_path)
         id2emb = build_imageid_to_embedding(emb_data)
+        id2name = build_imageid_to_imagename(emb_data)
 
         df = df[df[TYPE_COL].isin(type_to_head.keys())].copy()
         if df.empty:
@@ -431,6 +443,7 @@ def export_head_embeddings_csv(
                 row = {
                     "set_id": sid,
                     "image_id": str(r[IMAGE_ID_COL]),
+                    "image_name": id2name.get(str(r[IMAGE_ID_COL]), ""),
                     "type": str(r[TYPE_COL]),
                     "head_idx": int(h),
                 }
