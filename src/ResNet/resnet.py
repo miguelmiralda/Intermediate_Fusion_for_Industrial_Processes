@@ -1,9 +1,17 @@
 # ============================================================
 #  MULTI-HEAD TOOL WEAR TRAINING (USING PRECOMPUTED EMBEDDINGS)
+#  + Hyperparameter sweep over LR and head embedding dim
+#
 #  Model A: 2-head (flank_wear, adhesion) on TRAIN_SETS
 #  Model B: 1-head (flank_wear+adhesion) on FWAD_SETS (separate experiment)
 #
-#  Dense pairing: all-vs-all (i<j) within the SAME wear type
+#  Training pairing:
+#    - sorted by time within type
+#    - (i,j) for all i,j INCLUDING self-pairs (i,i)
+#    - optional cap: exclude near pairs (keep only j==i OR |j-i| > K)
+#
+#  Testing pairing ("ref" mode):
+#    - first image is reference; pairs (ref, j) for all j incl (ref,ref)
 #
 #  Inputs expected per set:
 #    data/processed/set{sid}/merged.csv
@@ -45,30 +53,35 @@ FWAD_TRAIN_SETS = [3, 13, 16]
 FWAD_VAL_SETS   = [12]
 FWAD_TEST_SETS  = [17]
 
-# Pairing logic: dense all-vs-all sorted by time within type
 PAIR_BY_TIME_COL = "anchor_time"
 
-# Cap dense pairing by index gap: only pair within j-i <= K after sorting by time.
-# Set to None to disable and use full all-vs-all.
-MAX_INDEX_GAP_K = 1
+# Cap for training (paper-style): exclude near/consecutive pairs.
+# Keep (i,i) always, and keep (i,j) only if |j-i| > K after sorting by time.
+# Example: K=1 => 1st pairs with 3rd; K=2 => 1st pairs with 4th.
+# Set to None to disable.
+MAX_INDEX_GAP_K = None
 
-
-# Columns in merged.csv
 WEAR_COL = "wear"
 TYPE_COL = "type"
 IMAGE_ID_COL = "image_id"
 
-# Training hyperparams
 BATCH_SIZE = 16
 EPOCHS = 20
-LR = 5e-4
 EMBED_IN_DIM = 2048
-HEAD_EMBED_DIM = 8
 
-# Wear types (must match values in merged.csv "type" column)
 TYPE_FW = "flank_wear"
 TYPE_AD = "adhesion"
 TYPE_FWAD = "flank_wear+adhesion"
+
+# ----------------------------
+# Hyperparameter sweep config
+# ----------------------------
+
+LR_GRID = [1e-3, 5e-4, 1e-4]
+HEAD_DIM_GRID = [8, 16, 32, 64, 128]
+
+# Set False if you don’t want to export head_embeddings csvs for every sweep run
+EXPORT_EMBEDDINGS_EACH_RUN = False
 
 
 # ----------------------------
@@ -85,14 +98,14 @@ def load_embeddings_npz(npz_path: Path) -> Dict[str, np.ndarray]:
         )
 
     out = {
-        "embeddings": data["embeddings"].astype(np.float32),  # (N, 2048)
-        "image_id": data["image_id"].astype(str),      # (N,)
+        "embeddings": data["embeddings"].astype(np.float32),
+        "image_id": data["image_id"].astype(str),
     }
-
     if "image_name" in data:
         out["image_name"] = data["image_name"].astype(str)
 
     return out
+
 
 def build_imageid_to_embedding(emb_data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     image_ids = emb_data["image_id"]
@@ -106,12 +119,14 @@ def build_imageid_to_embedding(emb_data: Dict[str, np.ndarray]) -> Dict[str, np.
         out[str(image_ids[i])] = vec
     return out
 
+
 def build_imageid_to_imagename(emb_data: Dict[str, np.ndarray]) -> Dict[str, str]:
     if "image_name" not in emb_data:
         return {}
     ids = emb_data["image_id"]
     names = emb_data["image_name"]
     return {str(ids[i]): str(names[i]) for i in range(min(len(ids), len(names)))}
+
 
 def load_merged_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -125,20 +140,19 @@ def load_merged_csv(path: Path) -> pd.DataFrame:
 
     df[TYPE_COL] = df[TYPE_COL].astype(str).str.strip()
     df[IMAGE_ID_COL] = df[IMAGE_ID_COL].astype(str).str.strip()
-
     return df
 
 
 # ----------------------------
-# Pair building (dense)
+# Pair building
 # ----------------------------
 
 @dataclass(frozen=True)
 class Pair:
-    E_ref: np.ndarray   # (2048,)
-    E_cur: np.ndarray   # (2048,)
-    d_wear: float       # scalar >= 0
-    head_idx: int       # which head to train (0/1), or 0 for single-head
+    E_ref: np.ndarray
+    E_cur: np.ndarray
+    d_wear: float
+    head_idx: int
 
 
 def _dense_pairs_from_df_for_type(
@@ -148,24 +162,23 @@ def _dense_pairs_from_df_for_type(
         head_idx: int,
 ) -> List[Pair]:
     """
-    Dense pairing (i<j) within the SAME wear_type, with optional cap by index gap:
-    only create pairs where (j - i) <= MAX_INDEX_GAP_K after sorting by time.
+    Training pairing:
+      - Sorted by time within wear_type
+      - Build (i,j) for all i and all j INCLUDING (i,i)
+      - If MAX_INDEX_GAP_K = K, exclude near pairs: keep (i,j) only if (j==i) or |j-i| > K
     """
     sub = df[df[TYPE_COL] == wear_type].copy()
     if sub.empty:
         return []
 
-    # Keep only rows with valid embeddings
     sub = sub[sub[IMAGE_ID_COL].isin(id2emb.keys())].copy()
     if sub.empty:
         return []
 
-    # Drop exact duplicates by image_id (keeps first in sorted order)
     if PAIR_BY_TIME_COL in sub.columns:
         sub = sub.sort_values(PAIR_BY_TIME_COL)
     sub = sub.drop_duplicates(subset=[IMAGE_ID_COL], keep="first").reset_index(drop=True)
 
-    # Parse wear as float; drop non-numeric
     def _to_float(x) -> Optional[float]:
         try:
             return float(x)
@@ -173,7 +186,6 @@ def _dense_pairs_from_df_for_type(
             return None
 
     wears: List[float] = []
-    # img_ids: List[str] = []
     embs: List[np.ndarray] = []
 
     for _, r in sub.iterrows():
@@ -184,36 +196,111 @@ def _dense_pairs_from_df_for_type(
         if iid not in id2emb:
             continue
         wears.append(float(w))
-        # img_ids.append(iid)
         embs.append(id2emb[iid])
 
     n = len(wears)
-    if n < 2:
+    if n < 1:
         return []
 
     K = MAX_INDEX_GAP_K
-    if K is not None and K < 1:
+    if K is not None and K < 0:
         return []
 
     pairs: List[Pair] = []
-    # Dense all-vs-all: i<j
-    for i in range(n - 1):
+
+    for i in range(n):
         Ei = embs[i]
         wi = wears[i]
 
-        # If cap is enabled: j runs only up to i+K
-        j_stop = n if K is None else min(n, i + K + 1)
+        if K is None:
+            for j in range(n):
+                pairs.append(Pair(E_ref=Ei, E_cur=embs[j], d_wear=abs(wears[j] - wi), head_idx=head_idx))
+        else:
+            # keep self
+            pairs.append(Pair(E_ref=Ei, E_cur=Ei, d_wear=0.0, head_idx=head_idx))
 
-        for j in range(i + 1, j_stop):
-            Ej = embs[j]
-            wj = wears[j]
-            pairs.append(Pair(E_ref=Ei, E_cur=Ej, d_wear=abs(wj - wi), head_idx=head_idx))
+            # far-left: j <= i-K-1  <=> j < i-K
+            left_stop = max(0, i - K)
+            for j in range(0, left_stop):
+                if j == i:
+                    continue
+                if abs(j - i) <= K:
+                    continue
+                pairs.append(Pair(E_ref=Ei, E_cur=embs[j], d_wear=abs(wears[j] - wi), head_idx=head_idx))
+
+            # far-right: j >= i+K+1
+            right_start = min(n, i + K + 1)
+            for j in range(right_start, n):
+                if j == i:
+                    continue
+                if abs(j - i) <= K:
+                    continue
+                pairs.append(Pair(E_ref=Ei, E_cur=embs[j], d_wear=abs(wears[j] - wi), head_idx=head_idx))
 
     return pairs
+
+
+def _reference_pairs_from_df_for_type(
+        df: pd.DataFrame,
+        id2emb: Dict[str, np.ndarray],
+        wear_type: str,
+        head_idx: int,
+) -> List[Pair]:
+    """
+    Testing pairing (reference mode):
+      - Sorted by time within wear_type
+      - Use FIRST image as reference
+      - Build (ref, j) for all j INCLUDING (ref, ref)
+    """
+    sub = df[df[TYPE_COL] == wear_type].copy()
+    if sub.empty:
+        return []
+
+    sub = sub[sub[IMAGE_ID_COL].isin(id2emb.keys())].copy()
+    if sub.empty:
+        return []
+
+    if PAIR_BY_TIME_COL in sub.columns:
+        sub = sub.sort_values(PAIR_BY_TIME_COL)
+    sub = sub.drop_duplicates(subset=[IMAGE_ID_COL], keep="first").reset_index(drop=True)
+
+    def _to_float(x) -> Optional[float]:
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    wears: List[float] = []
+    embs: List[np.ndarray] = []
+
+    for _, r in sub.iterrows():
+        w = _to_float(r[WEAR_COL])
+        if w is None or pd.isna(w):
+            continue
+        iid = str(r[IMAGE_ID_COL])
+        if iid not in id2emb:
+            continue
+        wears.append(float(w))
+        embs.append(id2emb[iid])
+
+    n = len(wears)
+    if n < 1:
+        return []
+
+    Eref = embs[0]
+    wref = wears[0]
+
+    return [
+        Pair(E_ref=Eref, E_cur=embs[j], d_wear=abs(wears[j] - wref), head_idx=head_idx)
+        for j in range(n)
+    ]
+
 
 def build_pairs_for_set_multitype(
         set_id: int,
         type_to_head: Dict[str, int],
+        *,
+        mode: str,  # "train" or "ref"
 ) -> List[Pair]:
     set_dir = PROCESSED_DIR / f"set{set_id}"
     merged_path = set_dir / "merged.csv"
@@ -234,7 +321,13 @@ def build_pairs_for_set_multitype(
     for wear_type, head_idx in type_to_head.items():
         sub = df[df[TYPE_COL] == wear_type]
         rows_used += len(sub)
-        pairs.extend(_dense_pairs_from_df_for_type(df, id2emb, wear_type, head_idx))
+
+        if mode == "train":
+            pairs.extend(_dense_pairs_from_df_for_type(df, id2emb, wear_type, head_idx))
+        elif mode == "ref":
+            pairs.extend(_reference_pairs_from_df_for_type(df, id2emb, wear_type, head_idx))
+        else:
+            raise ValueError(f"Unknown pairing mode: {mode}")
 
     print(f"[Set{set_id}] rows_used={rows_used} pairs_built={len(pairs)} types={list(type_to_head.keys())}")
     return pairs
@@ -243,10 +336,12 @@ def build_pairs_for_set_multitype(
 def build_pairs_over_sets(
         set_ids: List[int],
         type_to_head: Dict[str, int],
+        *,
+        mode: str,
 ) -> List[Pair]:
     all_pairs: List[Pair] = []
     for sid in set_ids:
-        all_pairs.extend(build_pairs_for_set_multitype(sid, type_to_head))
+        all_pairs.extend(build_pairs_for_set_multitype(sid, type_to_head, mode=mode))
     print(f"Total pairs: {len(all_pairs)}")
     return all_pairs
 
@@ -267,17 +362,17 @@ class WearPairDataset(Dataset):
         return (
             torch.tensor(p.E_ref, dtype=torch.float32),
             torch.tensor(p.E_cur, dtype=torch.float32),
-            torch.tensor([p.d_wear], dtype=torch.float32),   # (1,)
+            torch.tensor([p.d_wear], dtype=torch.float32),
             torch.tensor(p.head_idx, dtype=torch.long),
         )
 
 
 # ----------------------------
-# Model: Heads only (uses precomputed 2048-D embeddings)
+# Model: Heads only
 # ----------------------------
 
 class WearNetHead(nn.Module):
-    def __init__(self, in_dim: int = EMBED_IN_DIM, embed_dim: int = HEAD_EMBED_DIM):
+    def __init__(self, in_dim: int, embed_dim: int):
         super().__init__()
         self.embedding = nn.Linear(in_dim, embed_dim)
 
@@ -286,12 +381,8 @@ class WearNetHead(nn.Module):
 
 
 class WearDistanceLoss(nn.Module):
-    """
-    For a given head:
-        ||Z_cur - Z_ref||  ≈  d_wear
-    """
     def forward(self, Z_ref: torch.Tensor, Z_cur: torch.Tensor, d_wear: torch.Tensor) -> torch.Tensor:
-        d_embed = torch.norm(Z_cur - Z_ref, dim=1, keepdim=True)  # (B,1)
+        d_embed = torch.norm(Z_cur - Z_ref, dim=1, keepdim=True)
         return ((d_embed - d_wear) ** 2).mean()
 
 
@@ -306,12 +397,6 @@ def evaluate_heads_on_pairs(
         num_heads: int,
         batch_size: int = 256,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Returns per-head metrics:
-      mse: mean((pred_dist - d_wear)^2)
-      mae: mean(|pred_dist - d_wear|)
-      n:   number of samples for that head
-    """
     device = next(heads[0].parameters()).device
     ds = WearPairDataset(pairs)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
@@ -323,8 +408,8 @@ def evaluate_heads_on_pairs(
     for E_ref, E_cur, d_wear, head_idx in dl:
         E_ref = E_ref.to(device)
         E_cur = E_cur.to(device)
-        d_wear = d_wear.to(device)      # (B,1)
-        head_idx = head_idx.to(device)  # (B,)
+        d_wear = d_wear.to(device)
+        head_idx = head_idx.to(device)
 
         for h in range(num_heads):
             mask = (head_idx == h)
@@ -339,7 +424,7 @@ def evaluate_heads_on_pairs(
             Zr = heads[h](Er)
             Zc = heads[h](Ec)
 
-            pred = torch.norm(Zc - Zr, dim=1, keepdim=True)  # (m,1)
+            pred = torch.norm(Zc - Zr, dim=1, keepdim=True)
             err = pred - dw
 
             sum_se[h] += float((err ** 2).sum().item())
@@ -385,15 +470,9 @@ def export_head_embeddings_csv(
         set_ids: List[int],
         type_to_head: Dict[str, int],
 ) -> None:
-    """
-    Exports per-set CSV:
-      set{sid}/head_embeddings_{exp_name}.csv
-
-    Rows are taken from merged.csv filtered to types in type_to_head.
-    Each row uses the corresponding head for that type.
-    """
     heads, ckpt = load_heads_from_ckpt(ckpt_path)
     num_heads = int(ckpt["num_heads"])
+    embed_dim = int(ckpt["embed_dim"])
     device = next(heads[0].parameters()).device
 
     for sid in set_ids:
@@ -416,13 +495,17 @@ def export_head_embeddings_csv(
             continue
 
         df = df[df[IMAGE_ID_COL].isin(id2emb.keys())].copy()
+
+        if PAIR_BY_TIME_COL in df.columns:
+            df = df.sort_values(PAIR_BY_TIME_COL)
+        df = df.drop_duplicates(subset=[IMAGE_ID_COL], keep="first").reset_index(drop=True)
+
         if df.empty:
             print(f"[Export] Set{sid}: no rows with embeddings, skipping")
             continue
 
         df["head_idx"] = df[TYPE_COL].map(type_to_head).astype(int)
 
-        # Compute embeddings in batches per head
         rows_out = []
         for h in range(num_heads):
             sub = df[df["head_idx"] == h]
@@ -432,14 +515,15 @@ def export_head_embeddings_csv(
             X = np.stack([id2emb[str(iid)] for iid in sub[IMAGE_ID_COL].astype(str).tolist()], axis=0).astype(np.float32)
             Xt = torch.tensor(X, dtype=torch.float32, device=device)
 
-            # batched forward
             bs = 512
             Z_all = []
             for i in range(0, Xt.shape[0], bs):
                 Z_all.append(heads[h](Xt[i:i+bs]).detach().cpu().numpy())
-            Z = np.concatenate(Z_all, axis=0)  # (n, 8)
+            Z = np.concatenate(Z_all, axis=0)
 
-            for k, (_, r) in enumerate(sub.reset_index(drop=True).iterrows()):
+            sub2 = sub.reset_index(drop=True)
+            for k in range(len(sub2)):
+                r = sub2.iloc[k]
                 row = {
                     "set_id": sid,
                     "image_id": str(r[IMAGE_ID_COL]),
@@ -447,7 +531,7 @@ def export_head_embeddings_csv(
                     "type": str(r[TYPE_COL]),
                     "head_idx": int(h),
                 }
-                for d in range(HEAD_EMBED_DIM):
+                for d in range(embed_dim):
                     row[f"z{d}"] = float(Z[k, d])
                 rows_out.append(row)
 
@@ -470,16 +554,19 @@ def train_multhead(
         exp_name: str,
         pairs: List[Pair],
         num_heads: int,
-        epochs: int = EPOCHS,
-        batch_size: int = BATCH_SIZE,
-        lr: float = LR,
-        save_dir: Path = MODELS_DIR,
+        in_dim: int,
+        embed_dim: int,
+        epochs: int,
+        batch_size: int,
+        lr: float,
+        save_dir: Path,
 ) -> Path:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("\n==============================")
     print(f"Experiment: {exp_name}")
     print("Device:", device)
     print("Heads:", num_heads)
+    print(f"LR: {lr} | head_dim: {embed_dim}")
     print("==============================")
 
     if len(pairs) == 0:
@@ -488,7 +575,7 @@ def train_multhead(
     ds = WearPairDataset(pairs)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
 
-    heads = nn.ModuleList([WearNetHead().to(device) for _ in range(num_heads)])
+    heads = nn.ModuleList([WearNetHead(in_dim=in_dim, embed_dim=embed_dim).to(device) for _ in range(num_heads)])
     opts = [torch.optim.Adam(head.parameters(), lr=lr) for head in heads]
     criterion = WearDistanceLoss()
 
@@ -500,8 +587,8 @@ def train_multhead(
         for E_ref, E_cur, d_wear, head_idx in dl:
             E_ref = E_ref.to(device)
             E_cur = E_cur.to(device)
-            d_wear = d_wear.to(device)      # (B,1)
-            head_idx = head_idx.to(device)  # (B,)
+            d_wear = d_wear.to(device)
+            head_idx = head_idx.to(device)
 
             for h in range(num_heads):
                 mask = (head_idx == h)
@@ -521,7 +608,7 @@ def train_multhead(
                 loss.backward()
                 opts[h].step()
 
-                total_loss[h] += loss.item()
+                total_loss[h] += float(loss.item())
                 total_batches[h] += 1
 
         parts = []
@@ -535,8 +622,8 @@ def train_multhead(
     save_dir.mkdir(parents=True, exist_ok=True)
     ckpt = {
         "exp_name": exp_name,
-        "in_dim": EMBED_IN_DIM,
-        "embed_dim": HEAD_EMBED_DIM,
+        "in_dim": in_dim,
+        "embed_dim": embed_dim,
         "num_heads": num_heads,
         "state_dicts": [h.state_dict() for h in heads],
     }
@@ -545,9 +632,12 @@ def train_multhead(
     print("Saved model to:", out_path)
     return out_path
 
-# ----------------------------
-# Main: run both experiments + eval + export
-# ----------------------------
+
+def _fmt_lr(lr: float) -> str:
+    # safe filename-friendly lr string
+    s = f"{lr:.0e}" if lr < 1e-2 else f"{lr:g}"
+    return s.replace("+", "").replace(".", "p")
+
 
 def _print_metrics(tag: str, metrics: Dict[str, Dict[str, float]]) -> None:
     parts = []
@@ -556,50 +646,129 @@ def _print_metrics(tag: str, metrics: Dict[str, Dict[str, float]]) -> None:
     print(f"[{tag}] " + " | ".join(parts))
 
 
+# ----------------------------
+# Main: build pairs once, then sweep
+# ----------------------------
+
 def main():
-    # -------------------------
-    # Model A: 2-head (FW + AD)
-    # -------------------------
+    # Reproducibility (optional)
+    torch.manual_seed(0)
+    np.random.seed(0)
+
     type_to_head_A = {TYPE_FW: 0, TYPE_AD: 1}
-
-    pairs_A_train = build_pairs_over_sets(TRAIN_SETS, type_to_head_A)
-    pairs_A_val   = build_pairs_over_sets(VAL_SETS,   type_to_head_A)
-    pairs_A_test  = build_pairs_over_sets(TEST_SETS,  type_to_head_A)
-
-    ckpt_A = train_multhead(exp_name="wear_heads_FW_AD", pairs=pairs_A_train, num_heads=2)
-
-    heads_A, _ = load_heads_from_ckpt(ckpt_A)
-    _print_metrics("ModelA VAL",  evaluate_heads_on_pairs(heads_A, pairs_A_val,  num_heads=2))
-    _print_metrics("ModelA TEST", evaluate_heads_on_pairs(heads_A, pairs_A_test, num_heads=2))
-
-    export_head_embeddings_csv(
-        ckpt_path=ckpt_A,
-        exp_name="wear_heads_FW_AD",
-        set_ids=(TRAIN_SETS + VAL_SETS + TEST_SETS),
-        type_to_head=type_to_head_A,
-    )
-
-    # -------------------------
-    # Model B: 1-head (FW+AD) — separate experiment
-    # -------------------------
     type_to_head_B = {TYPE_FWAD: 0}
 
-    pairs_B_train = build_pairs_over_sets(FWAD_TRAIN_SETS, type_to_head_B)
-    pairs_B_val   = build_pairs_over_sets(FWAD_VAL_SETS,   type_to_head_B)
-    pairs_B_test  = build_pairs_over_sets(FWAD_TEST_SETS,  type_to_head_B)
+    # Build pairs ONCE (pairing does not depend on lr/head_dim)
+    print("\n=== Building pairs for Model A ===")
+    pairs_A_train = build_pairs_over_sets(TRAIN_SETS, type_to_head_A, mode="train")
+    pairs_A_val   = build_pairs_over_sets(VAL_SETS,   type_to_head_A, mode="ref")
+    pairs_A_test  = build_pairs_over_sets(TEST_SETS,  type_to_head_A, mode="ref")
 
-    ckpt_B = train_multhead(exp_name="wear_head_FWAD", pairs=pairs_B_train, num_heads=1)
+    print("\n=== Building pairs for Model B ===")
+    pairs_B_train = build_pairs_over_sets(FWAD_TRAIN_SETS, type_to_head_B, mode="train")
+    pairs_B_val   = build_pairs_over_sets(FWAD_VAL_SETS,   type_to_head_B, mode="ref")
+    pairs_B_test  = build_pairs_over_sets(FWAD_TEST_SETS,  type_to_head_B, mode="ref")
 
-    heads_B, _ = load_heads_from_ckpt(ckpt_B)
-    _print_metrics("ModelB VAL",  evaluate_heads_on_pairs(heads_B, pairs_B_val,  num_heads=1))
-    _print_metrics("ModelB TEST", evaluate_heads_on_pairs(heads_B, pairs_B_test, num_heads=1))
+    sweep_rows = []
 
-    export_head_embeddings_csv(
-        ckpt_path=ckpt_B,
-        exp_name="wear_head_FWAD",
-        set_ids=(FWAD_TRAIN_SETS + FWAD_VAL_SETS + FWAD_TEST_SETS),
-        type_to_head=type_to_head_B,
-    )
+    for head_dim in HEAD_DIM_GRID:
+        for lr in LR_GRID:
+            lr_tag = _fmt_lr(lr)
+            expA = f"wear_heads_FW_AD_dim{head_dim}_lr{lr_tag}"
+            expB = f"wear_head_FWAD_dim{head_dim}_lr{lr_tag}"
+
+            # ---------
+            # Train A
+            # ---------
+            ckpt_A = train_multhead(
+                exp_name=expA,
+                pairs=pairs_A_train,
+                num_heads=2,
+                in_dim=EMBED_IN_DIM,
+                embed_dim=head_dim,
+                epochs=EPOCHS,
+                batch_size=BATCH_SIZE,
+                lr=lr,
+                save_dir=MODELS_DIR,
+            )
+            heads_A, _ = load_heads_from_ckpt(ckpt_A)
+
+            mA_val  = evaluate_heads_on_pairs(heads_A, pairs_A_val,  num_heads=2)
+            mA_test = evaluate_heads_on_pairs(heads_A, pairs_A_test, num_heads=2)
+
+            _print_metrics(f"ModelA VAL  ({expA})", mA_val)
+            _print_metrics(f"ModelA TEST ({expA})", mA_test)
+
+            if EXPORT_EMBEDDINGS_EACH_RUN:
+                export_head_embeddings_csv(
+                    ckpt_path=ckpt_A,
+                    exp_name=expA,
+                    set_ids=(TRAIN_SETS + VAL_SETS + TEST_SETS),
+                    type_to_head=type_to_head_A,
+                )
+
+            # ---------
+            # Train B
+            # ---------
+            ckpt_B = train_multhead(
+                exp_name=expB,
+                pairs=pairs_B_train,
+                num_heads=1,
+                in_dim=EMBED_IN_DIM,
+                embed_dim=head_dim,
+                epochs=EPOCHS,
+                batch_size=BATCH_SIZE,
+                lr=lr,
+                save_dir=MODELS_DIR,
+            )
+            heads_B, _ = load_heads_from_ckpt(ckpt_B)
+
+            mB_val  = evaluate_heads_on_pairs(heads_B, pairs_B_val,  num_heads=1)
+            mB_test = evaluate_heads_on_pairs(heads_B, pairs_B_test, num_heads=1)
+
+            _print_metrics(f"ModelB VAL  ({expB})", mB_val)
+            _print_metrics(f"ModelB TEST ({expB})", mB_test)
+
+            if EXPORT_EMBEDDINGS_EACH_RUN:
+                export_head_embeddings_csv(
+                    ckpt_path=ckpt_B,
+                    exp_name=expB,
+                    set_ids=(FWAD_TRAIN_SETS + FWAD_VAL_SETS + FWAD_TEST_SETS),
+                    type_to_head=type_to_head_B,
+                )
+
+            # Collect summary row (TEST MAE only, as you requested)
+            row = {
+                "lr": lr,
+                "head_dim": head_dim,
+                "ModelA_Test_MAE_H0": float(mA_test["H0"]["mae"]),
+                "ModelA_Test_MAE_H1": float(mA_test["H1"]["mae"]),
+                "ModelB_Test_MAE_H0": float(mB_test["H0"]["mae"]),
+                "ModelA_Test_N_H0": int(mA_test["H0"]["n"]),
+                "ModelA_Test_N_H1": int(mA_test["H1"]["n"]),
+                "ModelB_Test_N_H0": int(mB_test["H0"]["n"]),
+                "expA": expA,
+                "expB": expB,
+            }
+            sweep_rows.append(row)
+
+    # Final summary table
+    summary_df = pd.DataFrame(sweep_rows).sort_values(["head_dim", "lr"]).reset_index(drop=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    out_csv = MODELS_DIR / "hparam_sweep_summary.csv"
+    summary_df.to_csv(out_csv, index=False)
+
+    print("\n==============================")
+    print("SUMMARY (TEST MAE)")
+    print("==============================")
+    # Short, readable print
+    for _, r in summary_df.iterrows():
+        print(
+            f"head_dim={int(r['head_dim']):3d} | lr={r['lr']:.6g} | "
+            f"A: H0_MAE={r['ModelA_Test_MAE_H0']:.6f}  H1_MAE={r['ModelA_Test_MAE_H1']:.6f} | "
+            f"B: H0_MAE={r['ModelB_Test_MAE_H0']:.6f}"
+        )
+    print(f"\nSaved summary CSV to: {out_csv}")
 
 
 if __name__ == "__main__":
