@@ -1,5 +1,3 @@
-
-
 import argparse
 import math
 import os
@@ -52,7 +50,7 @@ def npz_basename_from_row(sensor_window_path: str, sensor_name: str) -> str:
 
 
 def build_sensor_wear_matches(processed_root: Path, out_csv: Path) -> pd.DataFrame:
-     """
+    """
     Build a clean table:
       one row = one sensor .npz file + its wear label + wear type + set id.
 
@@ -95,10 +93,10 @@ def build_sensor_wear_matches(processed_root: Path, out_csv: Path) -> pd.DataFra
                     "type": str(r["type"]),
                 }
             )
-    
+
     # Drop duplicates just in case multiple rows map to the same NPZ
     match_df = pd.DataFrame(rows).drop_duplicates(subset=["sensor_npz"]).reset_index(drop=True)
-    
+
     # save the matching resultso we don't have to rebuild next run
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     match_df.to_csv(out_csv, index=False)
@@ -143,7 +141,7 @@ def window_stats_from_npz(npz_path: Path, window_size: int) -> np.ndarray:
         return np.zeros((1, 15), dtype=np.float32)
 
     X = np.stack(cols, axis=1)  # (N, 5)
-    
+
     # Window the time series into chunks
     num_windows = int(math.ceil(n / window_size))
     feats = []
@@ -224,14 +222,14 @@ class SensorWearDataset(Dataset):
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         npz_path = Path(row["sensor_npz"])
-        
+
         # Extract window features once per file and reuse
         if npz_path not in self._cache:
             self._cache[npz_path] = window_stats_from_npz(npz_path, self.window_size)
 
         x = self._cache[npz_path]  # (T, 15)
         # Normalize with training-set statistics
-        x = (x - self.mean) / self.std 
+        x = (x - self.mean) / self.std
 
         x = torch.from_numpy(x).float()
         y = torch.tensor(float(row["wear"]), dtype=torch.float32)
@@ -281,8 +279,8 @@ class LSTMWearRegressor(nn.Module):
         _, (h_n, _) = self.lstm(packed)
 
         # h_n shape: (num_layers, B, hidden). Take last layer.
-        last = h_n[-1]  
-        out = self.head(last).squeeze(1)  
+        last = h_n[-1]
+        out = self.head(last).squeeze(1)
         return out
 
 
@@ -454,52 +452,10 @@ def main():
     print(f"Test RMSE: {test_metrics['rmse']:.6f}")
     print(f"Test MAE : {test_metrics['mae']:.6f}")
 
-    # MAE by type : one model, but report per-type MAE.
+    # MAE by type: one model, but report per-type MAE.
     preds = test_metrics["preds"]
     targets = test_metrics["targets"]
     types = test_metrics["types"]
-
-    # ===== PLOT: Predicted vs Actual wear (Test) =====
-    import matplotlib.pyplot as plt
-
-    unit = "µm"  # change to "mm" only if you later divide wear by 1000 in the script
-
-    # Convert to numpy arrays (types is list of strings)
-    preds_arr = np.asarray(preds, dtype=np.float64)
-    targets_arr = np.asarray(targets, dtype=np.float64)
-    types_arr = np.asarray(types, dtype=object)
-
-    plt.figure(figsize=(7, 6))
-
-    # Plot each type separately (different colors automatically)
-    for wear_type in ["flank_wear", "flank_wear+adhesion"]:
-        m = (types_arr == wear_type)
-        if m.sum() == 0:
-            continue
-        plt.scatter(
-            targets_arr[m], preds_arr[m],
-            s=20, alpha=0.8,
-            label=f"{wear_type} (n={m.sum()})"
-        )
-
-    # y = x line (ideal prediction)
-    lo = float(min(targets_arr.min(), preds_arr.min()))
-    hi = float(max(targets_arr.max(), preds_arr.max()))
-    plt.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1, color="gray", label="y = x")
-
-    plt.xlabel(f"Actual wear ({unit})")
-    plt.ylabel(f"Predicted wear ({unit})")
-    plt.title("Test: Predicted vs Actual wear (LSTM)")
-    plt.legend()
-    plt.tight_layout()
-
-    plot_path = out_dir / "test_pred_vs_actual.png"
-    plt.savefig(plot_path, dpi=200)
-    plt.close()
-
-    print(f"[OK] Saved plot -> {plot_path}")
-    # ===============================================
-
 
     print("\n=== TEST MAE BY TYPE ===")
     for type_name in ["flank_wear", "flank_wear+adhesion"]:
