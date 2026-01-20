@@ -15,17 +15,17 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
 
-
-
+# Use 5 sensor channels and only two wear types for this baseline.
 FEATURE_KEYS = ["accel", "acoustic", "force_x", "force_y", "force_z"]
 KEEP_TYPES = {"flank_wear", "flank_wear+adhesion"}
 
+# Split the sets in training, validation and test sets.
 TRAIN_SETS = [1, 2, 5, 7, 8, 10, 11, 16, 17]
 VAL_SETS   = [3, 6, 12, 14]
 TEST_SETS  = [4, 9, 13, 15]
 
-
 def set_seed(seed: int) -> None:
+    """Make runs more repeatable (same splits/shuffling/initialization)."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -34,7 +34,10 @@ def set_seed(seed: int) -> None:
 
 
 def npz_basename_from_row(sensor_window_path: str, sensor_name: str) -> str:
-    
+    """
+    merged.csv often stores a full path to the sensor window file.
+    We only need the filename so we can find the corresponding .npz locally.
+    """
     if isinstance(sensor_window_path, str) and sensor_window_path.strip():
         base = os.path.basename(sensor_window_path)
         if base.lower().endswith(".npz"):
@@ -49,7 +52,14 @@ def npz_basename_from_row(sensor_window_path: str, sensor_name: str) -> str:
 
 
 def build_sensor_wear_matches(processed_root: Path, out_csv: Path) -> pd.DataFrame:
-    
+     """
+    Build a clean table:
+      one row = one sensor .npz file + its wear label + wear type + set id.
+
+    This is the connection between:
+      processed/setX/merged.csv  (labels + metadata)
+      processed/setX/sensordata  (actual NPZ sensor files)
+    """
     rows = []
     skipped_missing_npz = 0
 
@@ -57,13 +67,13 @@ def build_sensor_wear_matches(processed_root: Path, out_csv: Path) -> pd.DataFra
         set_dir = processed_root / f"set{s}"
         merged_path = set_dir / "merged.csv"
         sens_dir = set_dir / "sensordata"
-
+        # skip sets that are missing required files/folders
         if not merged_path.exists() or not sens_dir.exists():
             continue
 
         df = pd.read_csv(merged_path)
 
-        # Keep only the two requested types, drop rows without wear.
+        # Keep only the two requested types(fank and flank+adhesion), drop rows without wear value.
         df = df[df["type"].isin(KEEP_TYPES)].dropna(subset=["wear"])
 
         for _, r in df.iterrows():
@@ -85,9 +95,11 @@ def build_sensor_wear_matches(processed_root: Path, out_csv: Path) -> pd.DataFra
                     "type": str(r["type"]),
                 }
             )
-
+    
+    # Drop duplicates just in case multiple rows map to the same NPZ
     match_df = pd.DataFrame(rows).drop_duplicates(subset=["sensor_npz"]).reset_index(drop=True)
-
+    
+    # save the matching resultso we don't have to rebuild next run
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     match_df.to_csv(out_csv, index=False)
 
@@ -100,7 +112,18 @@ def build_sensor_wear_matches(processed_root: Path, out_csv: Path) -> pd.DataFra
 
 
 def window_stats_from_npz(npz_path: Path, window_size: int) -> np.ndarray:
-   
+    """
+    Turn one long sensor recording into a short *sequence* of features.
+
+    Steps:
+    - Load 5 channels from NPZ -> shape (N, 5)
+    - Split into windows of length window_size
+    - For each window compute: mean, std, rms for each channel
+      -> 5 channels * 3 stats = 15 numbers per window
+
+    Output:
+      feats of shape (T, 15) where T = number of windows for this run.
+    """
     data = np.load(npz_path)
 
     # Load and stack channels into X: (N, 5)
@@ -112,6 +135,7 @@ def window_stats_from_npz(npz_path: Path, window_size: int) -> np.ndarray:
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         cols.append(arr)
 
+    # Basic sanity checks
     n = len(cols[0])
     if any(len(c) != n for c in cols):
         raise ValueError(f"Channel length mismatch in {npz_path}")
@@ -119,7 +143,8 @@ def window_stats_from_npz(npz_path: Path, window_size: int) -> np.ndarray:
         return np.zeros((1, 15), dtype=np.float32)
 
     X = np.stack(cols, axis=1)  # (N, 5)
-
+    
+    # Window the time series into chunks
     num_windows = int(math.ceil(n / window_size))
     feats = []
 
@@ -128,7 +153,7 @@ def window_stats_from_npz(npz_path: Path, window_size: int) -> np.ndarray:
         end = min((w + 1) * window_size, n)
         chunk = X[start:end]  # (valid_len, 5)
 
-        # Stats computed only on real rows (no padded zeros included)
+        # Simple summary statistics per window
         mean = chunk.mean(axis=0)
         std = chunk.std(axis=0)  # population std (ddof=0)
         rms = np.sqrt((chunk ** 2).mean(axis=0))
@@ -199,12 +224,14 @@ class SensorWearDataset(Dataset):
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         npz_path = Path(row["sensor_npz"])
-
+        
+        # Extract window features once per file and reuse
         if npz_path not in self._cache:
             self._cache[npz_path] = window_stats_from_npz(npz_path, self.window_size)
 
         x = self._cache[npz_path]  # (T, 15)
-        x = (x - self.mean) / self.std  # normalize using training-set stats
+        # Normalize with training-set statistics
+        x = (x - self.mean) / self.std 
 
         x = torch.from_numpy(x).float()
         y = torch.tensor(float(row["wear"]), dtype=torch.float32)
@@ -213,7 +240,11 @@ class SensorWearDataset(Dataset):
 
 
 def collate_batch(batch):
-   
+    """
+    Create a batch of variable-length sequences.
+
+    We pad to (B, Tmax, 15) and also return the original lengths so the LSTM can ignore padding.
+    """
     xs, lens, ys, ts = zip(*batch)
 
     # Sort by length (required for pack_padded_sequence with enforce_sorted=True)
@@ -230,7 +261,9 @@ def collate_batch(batch):
 
 
 class LSTMWearRegressor(nn.Module):
-    
+
+    """Reads a (T,15) feature sequence and predicts one wear value."""
+
     def __init__(self, input_size=15, hidden_size=64, num_layers=2, dropout=0.2):
         super().__init__()
         self.lstm = nn.LSTM(
@@ -243,17 +276,19 @@ class LSTMWearRegressor(nn.Module):
         self.head = nn.Linear(hidden_size, 1)
 
     def forward(self, x_pad: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        # Pack padded sequences so LSTM skips padded time steps
         packed = pack_padded_sequence(x_pad, lengths.cpu(), batch_first=True, enforce_sorted=True)
         _, (h_n, _) = self.lstm(packed)
 
         # h_n shape: (num_layers, B, hidden). Take last layer.
-        last = h_n[-1]  # (B, hidden)
-        out = self.head(last).squeeze(1)  # (B,)
+        last = h_n[-1]  
+        out = self.head(last).squeeze(1)  
         return out
 
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    """Compute MSE/RMSE/MAE on a dataloader and return predictions + metadata."""
     model.eval()
     preds, targets, types = [], [], []
 
@@ -279,6 +314,7 @@ def evaluate(model, loader, device):
 
 
 def train_one_epoch(model, loader, opt, device):
+    """One training epoch (MSE loss + gradient clipping for stability)."""
     model.train()
     loss_fn = nn.MSELoss()
 
@@ -307,6 +343,8 @@ def train_one_epoch(model, loader, opt, device):
 
 
 def main():
+    # This is to change settings without editing code)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--processed_root", type=str, default="processed",
                         help="Path to processed/ (contains set1..set17).")
@@ -334,7 +372,7 @@ def main():
     scaler_npz  = out_dir / "window_feature_scaler.npz"
     best_model  = out_dir / "best_model.pt"
 
-    # 1) Build or load the matches table.
+    # Build or load the matches table.
     if matches_csv.exists() and not args.rebuild_matches:
         match_df = pd.read_csv(matches_csv)
         print(f"[OK] Loaded matches: {matches_csv} (rows={len(match_df)})")
@@ -342,10 +380,10 @@ def main():
         match_df = build_sensor_wear_matches(processed_root, matches_csv)
         print(f"[OK] Saved matches to: {matches_csv}")
 
-    # 2) Split by set IDs.
+    # Split by sets
     train_df, val_df, test_df = split_by_sets(match_df)
 
-    # 3) Fit or load feature scaler (mean/std) using ONLY training set.
+    # Fit or load feature scaler (mean/std) using ONLY training set.
     if scaler_npz.exists() and not args.refit_scaler:
         z = np.load(scaler_npz)
         mean, std = z["mean"].astype(np.float32), z["std"].astype(np.float32)
@@ -356,7 +394,7 @@ def main():
         np.savez(scaler_npz, mean=mean, std=std)
         print(f"[OK] Saved feature scaler to: {scaler_npz}")
 
-    # 4) Build PyTorch datasets/loaders.
+    # Build PyTorch datasets/loaders.
     train_ds = SensorWearDataset(train_df, args.window_size, mean, std)
     val_ds   = SensorWearDataset(val_df, args.window_size, mean, std)
     test_ds  = SensorWearDataset(test_df, args.window_size, mean, std)
@@ -364,7 +402,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin = (device.type == "cuda")
 
-    #Training, testing, validation....
+    # Training, testing, validation....
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_batch, num_workers=0, pin_memory=pin)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
@@ -372,13 +410,13 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              collate_fn=collate_batch, num_workers=0, pin_memory=pin)
 
-    # 5) Model + optimizer.
+    # Model + optimizer.
     model = LSTMWearRegressor(hidden_size=args.hidden_size,
                               num_layers=args.num_layers,
                               dropout=args.dropout).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # 6) Train, selecting the best model by validation RMSE.
+    # Train, selecting the best model by validation RMSE.
     best_val_rmse = float("inf")
 
     print("\n=== TRAINING ===")
@@ -393,7 +431,7 @@ def main():
             f"val_RMSE={val_metrics['rmse']:.6f} "
             f"val_MAE={val_metrics['mae']:.6f}"
         )
-
+        # Save the model only when validation improves
         if val_metrics["rmse"] < best_val_rmse:
             best_val_rmse = val_metrics["rmse"]
             torch.save(model.state_dict(), best_model)
@@ -401,7 +439,7 @@ def main():
     print(f"\n[OK] Best validation RMSE: {best_val_rmse:.6f}")
     print(f"[OK] Best model saved to: {best_model}")
 
-    # 7) Test evaluation (load best model first).
+    # Test evaluation (load best model first).
     # This avoids a PyTorch warning on newer versions, while still being compatible with older ones.
     try:
         state = torch.load(best_model, map_location=device, weights_only=True)
@@ -416,7 +454,7 @@ def main():
     print(f"Test RMSE: {test_metrics['rmse']:.6f}")
     print(f"Test MAE : {test_metrics['mae']:.6f}")
 
-    # MAE by type (requested): one model, but report per-type MAE.
+    # MAE by type : one model, but report per-type MAE.
     preds = test_metrics["preds"]
     targets = test_metrics["targets"]
     types = test_metrics["types"]
