@@ -1,17 +1,4 @@
-"""
-MATWI sensor wear LSTM (simple baseline).
 
-This script:
-- Matches NPZ sensor files to wear labels using each set's merged.csv
-- Keeps only wear types: flank_wear and flank_wear+adhesion (ignores adhesion)
-- Splits by sets (train/val/test) exactly as requested
-- Turns each NPZ into a sequence of window features:
-    window = 1000 rows
-    features per window = mean, std, rms of 5 channels
-      (accel, acoustic, force_x, force_y, force_z)
-- Trains one LSTM regression model
-- Reports MSE/RMSE/MAE, and test MAE separately for the two types
-"""
 
 import argparse
 import math
@@ -39,7 +26,6 @@ TEST_SETS  = [4, 9, 13, 15]
 
 
 def set_seed(seed: int) -> None:
-    """Make results more repeatable."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -48,15 +34,7 @@ def set_seed(seed: int) -> None:
 
 
 def npz_basename_from_row(sensor_window_path: str, sensor_name: str) -> str:
-    """
-    Get the expected .npz filename from merged.csv.
-
-    merged.csv often stores a full absolute path in sensor_window_path.
-    We only need the filename (basename), then we look for it locally.
-
-    If sensor_window_path is empty/weird, we fall back to sensor_name and convert
-    .csv -> .npz.
-    """
+    
     if isinstance(sensor_window_path, str) and sensor_window_path.strip():
         base = os.path.basename(sensor_window_path)
         if base.lower().endswith(".npz"):
@@ -71,12 +49,7 @@ def npz_basename_from_row(sensor_window_path: str, sensor_name: str) -> str:
 
 
 def build_sensor_wear_matches(processed_root: Path, out_csv: Path) -> pd.DataFrame:
-    """
-    Create a clean table: one row per matched sensor NPZ file.
-
-    Output columns:
-      set, sensor_npz, wear, type
-    """
+    
     rows = []
     skipped_missing_npz = 0
 
@@ -127,16 +100,7 @@ def build_sensor_wear_matches(processed_root: Path, out_csv: Path) -> pd.DataFra
 
 
 def window_stats_from_npz(npz_path: Path, window_size: int) -> np.ndarray:
-    """
-    Convert one NPZ file into a sequence of (mean, std, rms) features.
-
-    Returns:
-      feats: shape (T, 15) where 15 = 5 channels * 3 stats
-
-    Last window:
-      If it has < window_size rows, we "pad with zeros" conceptually,
-      BUT we compute stats using only the real rows (so padding zeros do not affect stats).
-    """
+   
     data = np.load(npz_path)
 
     # Load and stack channels into X: (N, 5)
@@ -214,7 +178,6 @@ def split_by_sets(match_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
 
 class SensorWearDataset(Dataset):
     """
-    One sample = one sensor NPZ file.
 
     Returns:
       x: (T, 15) normalized window features
@@ -250,9 +213,7 @@ class SensorWearDataset(Dataset):
 
 
 def collate_batch(batch):
-    """
-    Pad sequences so we can train with batches.
-    """
+   
     xs, lens, ys, ts = zip(*batch)
 
     # Sort by length (required for pack_padded_sequence with enforce_sorted=True)
@@ -269,9 +230,7 @@ def collate_batch(batch):
 
 
 class LSTMWearRegressor(nn.Module):
-    """
-    LSTM -> last hidden state -> linear -> wear prediction (scalar)
-    """
+    
     def __init__(self, input_size=15, hidden_size=64, num_layers=2, dropout=0.2):
         super().__init__()
         self.lstm = nn.LSTM(
@@ -354,7 +313,7 @@ def main():
     parser.add_argument("--out_dir", type=str, default="lstm_windowstats_runs",
                         help="Folder to save matches, scaler, and best_model.pt")
     parser.add_argument("--window_size", type=int, default=813)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_size", type=int, default=64)
